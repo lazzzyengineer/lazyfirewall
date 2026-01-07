@@ -104,6 +104,15 @@ Engine failure never blocks requests.
 - Linux packages
 - installer automation
 
+## Goals of Next Phase 
+### By the end of this phase:
+
+- NGINX never hangs
+- Firewall has timeouts
+- Fail-open / fail-close is configurable
+- Engine is reusable & fast
+- Behavior is predictable under load
+
 ---
 
 ## Philosophy
