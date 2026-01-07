@@ -57,7 +57,7 @@ static ngx_int_t ngx_lazyfirewall_handler(ngx_http_request_t *r) {
                 &r->connection->addr_text,
                 &r->method_name,
                 &r->uri);
-    return NGX_DECLINED;
+    return lazyfirewall_call_engine(r);
 }
 
 static ngx_int_t ngx_lazyfirewall_init(ngx_conf_t *cf) {
