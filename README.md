@@ -115,4 +115,3 @@ Security should never cause downtime.
 ---
 
 Built by LazyEngineer
-# lazyfirewall
