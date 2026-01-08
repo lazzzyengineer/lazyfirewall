@@ -88,13 +88,15 @@ NGINX remains the enforcement point at all times.
 - Low latency and predictable performance
 - Clear separation of enforcement and decision logic
 
+`
 Client
   ↓
 NGINX (C module, ACCESS phase)
   ↓ (metadata JSON over Unix socket)
 Go decision engine
   ↓
-NGINX allow / block
+NGINX allow / block `
+
 ---
 
 ### Role of the Go Engine
