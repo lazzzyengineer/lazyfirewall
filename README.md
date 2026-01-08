@@ -88,6 +88,13 @@ NGINX remains the enforcement point at all times.
 - Low latency and predictable performance
 - Clear separation of enforcement and decision logic
 
+Client
+  ↓
+NGINX (C module, ACCESS phase)
+  ↓ (metadata JSON over Unix socket)
+Go decision engine
+  ↓
+NGINX allow / block
 ---
 
 ### Role of the Go Engine
@@ -155,6 +162,7 @@ Engine failure never blocks requests.
 - metrics
 - Linux packages
 - installer automation
+- add POST body inspection
 
 ### By the end of next phase:
 
