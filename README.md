@@ -90,11 +90,11 @@ NGINX remains the enforcement point at all times.
 
 `
 Client
-  ↓
+↓
 NGINX (C module, ACCESS phase)
-  ↓ (metadata JSON over Unix socket)
+↓(metadata JSON over Unix socket)
 Go decision engine
-  ↓
+↓
 NGINX allow / block `
 
 ---
