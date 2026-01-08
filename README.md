@@ -23,34 +23,93 @@ Key ideas:
 
 ---
 
-## How it works
+## How LazyFirewall Works
 
-On NGINX startup:
-- the module walks all HTTP locations
-- it injects auth_request everywhere
-- existing auth_request is preserved and chained
+LazyFirewall is a native NGINX Web Application Firewall implemented as a C module,
+with request decision logic handled by an external Go engine.
 
-For each request:
-- NGINX asks the Go engine
-- the engine replies allow or block
-- NGINX enforces the decision
-
-If the engine is down:
-- requests are allowed
-- no downtime
+NGINX remains the enforcement point at all times.
 
 ---
 
-## auth_request compatibility
+### On NGINX Startup
 
-NGINX supports only one auth_request per location.
+- The LazyFirewall module is loaded into NGINX
+- A handler is registered in the HTTP ACCESS phase
+- A shared memory zone is initialized to track backend health
+- No changes to existing location blocks are required
 
-LazyFirewall handles this safely:
-- existing auth_request is detected
-- the Go engine calls the original auth first
-- firewall logic runs after
+---
 
-No authentication is broken.
+### On Each Request
+
+- The request reaches the ACCESS phase
+- LazyFirewall extracts request metadata:
+  - client IP
+  - host header
+  - HTTP method
+  - full unparsed URI
+- This data is serialized as JSON
+- The JSON payload is sent to the Go engine over a UNIX socket
+- The engine replies with a decision:
+  - `block`
+  - any other value means allow
+- If the response is `block`, NGINX immediately returns HTTP 403
+- Otherwise, the request continues normally
+
+---
+
+### Backend Health Handling
+
+- Backend failures are tracked in shared memory
+- If the engine becomes unavailable:
+  - a cooldown window is activated
+  - new requests skip engine calls during this period
+- Behavior during engine failure is configurable:
+  - fail open: requests are allowed
+  - fail closed: requests are blocked
+
+---
+
+### Concurrency Model
+
+- Each NGINX worker process maintains its own persistent socket connection
+- Workers are single-threaded, so no per-request locking is required
+- Shared memory is used only for health signaling between workers
+- Mutex protection ensures safe cross-worker updates
+
+---
+
+### Why This Design
+
+- Zero per-request NGINX subrequests
+- No dependency on `auth_request`
+- No configuration changes required per location
+- Low latency and predictable performance
+- Clear separation of enforcement and decision logic
+
+Client
+  ↓
+NGINX (C module, ACCESS phase)
+  ↓ (metadata JSON over Unix socket)
+Go decision engine
+  ↓
+NGINX allow / block
+---
+
+### Role of the Go Engine
+
+The Go engine acts as the policy and intelligence layer.
+
+It can:
+- implement rate limiting
+- perform IP reputation checks
+- apply behavioral rules
+- integrate with external systems
+- evolve independently of NGINX
+
+NGINX enforces the decision, the engine decides.
+
 
 ---
 
@@ -103,9 +162,9 @@ Engine failure never blocks requests.
 - metrics
 - Linux packages
 - installer automation
+- add POST body inspection
 
-## Goals of Next Phase 
-### By the end of this phase:
+### By the end of next phase:
 
 - NGINX never hangs
 - Firewall has timeouts
