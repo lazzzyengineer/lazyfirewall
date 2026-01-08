@@ -88,8 +88,7 @@ NGINX remains the enforcement point at all times.
 - Low latency and predictable performance
 - Clear separation of enforcement and decision logic
 
-```
-mermaid
+```mermaid
 sequenceDiagram
     participant Client
     participant NGINX as NGINX<br/>(lazyfirewall C module<br/>ACCESS phase handler)
