@@ -88,13 +88,23 @@ NGINX remains the enforcement point at all times.
 - Low latency and predictable performance
 - Clear separation of enforcement and decision logic
 
-Client
-  ↓
-NGINX (C module, ACCESS phase)
-  ↓ (metadata JSON over Unix socket)
-Go decision engine
-  ↓
-NGINX allow / block
+```mermaid
+sequenceDiagram
+    participant Client
+    participant NGINX as NGINX<br/>(lazyfirewall C module<br/>ACCESS phase handler)
+    participant Engine as Go Decision Engine
+
+    Client->>NGINX: HTTP Request
+    Note over NGINX: Early check in ACCESS phase
+    NGINX->>Engine: Send metadata JSON<br/>(ip, host, method, uri)<br/>over Unix domain socket
+    Engine-->>NGINX: Response ("block" or any other string)
+    alt Response == "block"
+        NGINX-->>Client: 403 Forbidden
+    else
+        NGINX-->>Client: Proceed (DECLINED → next phases)
+    end
+```
+
 ---
 
 ### Role of the Go Engine
