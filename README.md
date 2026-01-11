@@ -162,6 +162,19 @@ Default behavior is allow.
 Only explicit block decisions deny traffic.
 Engine failure never blocks requests.
 
+### Is This More Secure Than AppSec / ModSecurity?
+
+Because:
+- Smaller trusted computing base
+- Clear trust boundary
+- No black-box logic
+- No runtime config mutation
+- No magic directives
+
+But:
+- AppSec ships with years of rules
+- We must build policy carefully
+
 ---
 
 ## Roadmap
