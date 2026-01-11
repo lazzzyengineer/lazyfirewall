@@ -8,14 +8,25 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <ctype.h>
 
-// shared memory structure for health tracking
+/* Declare the module extern before use */
+extern ngx_module_t ngx_http_lazyfirewall_module;
+
+static ngx_int_t ngx_lazyfirewall_handler(ngx_http_request_t *r);
+
+static ngx_str_t lazyfw_default_engine = ngx_string("unix:/tmp/lazyfirewall.sock");
+/* =========================================================
+ * Shared memory for health
+ * ========================================================= */
 typedef struct {
     ngx_shmtx_sh_t  lock;
     time_t          last_failure;
 } lazyfw_health_sh_t;
 
-// module main configuration
+/* =========================================================
+ * Module configuration
+ * ========================================================= */
 typedef struct {
     ngx_str_t               engine;
     ngx_flag_t              fail_open;
@@ -33,11 +44,13 @@ static int lazyfw_sock = -1;
 
 #define LAZYFW_HEALTH_COOLDOWN  10   /* seconds */
 
-// shm zone init function
+/* =========================================================
+ * SHM zone init (only copy data on reload)
+ * ========================================================= */
 static ngx_int_t
 lazyfw_health_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 {
-    lazyfw_health_sh_t *sh = shm_zone->shm.addr;
+    lazyfw_health_sh_t *sh = (lazyfw_health_sh_t *) shm_zone->shm.addr;
 
     if (data) {
         lazyfw_health_sh_t *old = data;
@@ -49,7 +62,9 @@ lazyfw_health_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     return NGX_OK;
 }
 
-// json escaping function
+/* =========================================================
+ * JSON escaping
+ * ========================================================= */
 static u_char *
 lazyfw_append_json_escaped(u_char *p, u_char *end, ngx_str_t *str)
 {
@@ -87,11 +102,15 @@ lazyfw_append_json_escaped(u_char *p, u_char *end, ngx_str_t *str)
     return p;
 }
 
-// config create/merge post functions
+/* =========================================================
+ * Config create / merge / postconfig
+ * ========================================================= */
 static void *
 ngx_lazyfirewall_create_conf(ngx_conf_t *cf)
 {
-    ngx_lazyfirewall_conf_t *conf = ngx_pcalloc(cf->pool, sizeof(ngx_lazyfirewall_conf_t));
+    ngx_lazyfirewall_conf_t *conf;
+
+    conf = ngx_pcalloc(cf->pool, sizeof(ngx_lazyfirewall_conf_t));
     if (conf == NULL) {
         return NULL;
     }
@@ -108,16 +127,25 @@ ngx_lazyfirewall_create_conf(ngx_conf_t *cf)
 }
 
 static char *
-ngx_lazyfirewall_merge_conf(ngx_conf_t *cf, void *parent, void *child)
+ngx_lazyfirewall_init_main_conf(ngx_conf_t *cf, void *conf_ptr)
 {
-    ngx_lazyfirewall_conf_t *prev = parent;
-    ngx_lazyfirewall_conf_t *conf = child;
+    ngx_lazyfirewall_conf_t *conf = conf_ptr;
 
-    ngx_conf_merge_str_value(conf->engine, prev->engine, "");
-    ngx_conf_merge_value(conf->fail_open, prev->fail_open, 0);
-    ngx_conf_merge_msec_value(conf->timeout, prev->timeout, 500);
-    ngx_conf_merge_uint_value(conf->max_uri_len, prev->max_uri_len, 4096);
-    ngx_conf_merge_uint_value(conf->max_host_len, prev->max_host_len, 255);
+    if (conf->fail_open == NGX_CONF_UNSET) {
+        conf->fail_open = 0;
+    }
+
+    if (conf->timeout == NGX_CONF_UNSET_MSEC) {
+        conf->timeout = 500;
+    }
+
+    if (conf->max_uri_len == NGX_CONF_UNSET_UINT) {
+        conf->max_uri_len = 4096;
+    }
+
+    if (conf->max_host_len == NGX_CONF_UNSET_UINT) {
+        conf->max_host_len = 255;
+    }
 
     if (conf->engine.len > 0) {
         if (conf->engine.len <= 5 || ngx_strncmp(conf->engine.data, (u_char *)"unix:", 5) != 0) {
@@ -137,35 +165,53 @@ ngx_lazyfirewall_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 static ngx_int_t
 ngx_lazyfirewall_postconfig(ngx_conf_t *cf)
 {
-    ngx_lazyfirewall_conf_t *conf = ngx_http_conf_get_module_main_conf(cf, ngx_http_lazyfirewall_module);
+    ngx_lazyfirewall_conf_t   *conf;
+    ngx_http_handler_pt       *h;
+    ngx_http_core_main_conf_t *cmcf;
 
-    if (conf->engine.len == 0) {
-        return NGX_OK;
+    /* Setup shared memory if engine enabled */
+    conf = ngx_http_conf_get_module_main_conf(cf, ngx_http_lazyfirewall_module);
+
+    if (conf->engine.len > 0) {
+        ngx_str_t name = ngx_string("lazyfw_health");
+
+        conf->health_zone = ngx_shared_memory_add(
+            cf, &name, sizeof(lazyfw_health_sh_t),
+            &ngx_http_lazyfirewall_module
+        );
+
+        if (conf->health_zone == NULL) {
+            return NGX_ERROR;
+        }
+
+        conf->health_zone->init = lazyfw_health_init_zone;
+        conf->health_zone->data = NULL;
     }
 
-    ngx_str_t name = ngx_string("lazyfw_health");
-    ngx_shm_zone_t *shm_zone = ngx_shared_memory_add(cf, &name, sizeof(lazyfw_health_sh_t),
-                                                     &ngx_http_lazyfirewall_module);
-    if (shm_zone == NULL) {
+    /* Register access phase handler */
+    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_PREACCESS_PHASE].handlers);
+    if (h == NULL) {
         return NGX_ERROR;
     }
 
-    shm_zone->init = lazyfw_health_init_zone;
-    shm_zone->data = NULL;
-
-    conf->health_zone = shm_zone;
+    *h = ngx_lazyfirewall_handler;
 
     return NGX_OK;
 }
 
-// process init/exit functions
+
+/* =========================================================
+ * Process init/exit
+ * ========================================================= */
 static ngx_int_t
 ngx_lazyfirewall_init_process(ngx_cycle_t *cycle)
 {
     ngx_lazyfirewall_conf_t *conf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_lazyfirewall_module);
 
     if (conf && conf->health_zone) {
-        conf->health = conf->health_zone->shm.addr;
+        conf->health = (lazyfw_health_sh_t *) conf->health_zone->shm.addr;
 
         if (ngx_shmtx_create(&conf->health_mutex, &conf->health->lock,
                              conf->health_zone->shm.name.data) != NGX_OK) {
@@ -187,36 +233,54 @@ ngx_lazyfirewall_exit_process(ngx_cycle_t *cycle)
     }
 }
 
-// directive definitions
+/* =========================================================
+ * Directives
+ * ========================================================= */
 static ngx_command_t ngx_lazyfirewall_commands[] = {
-    { ngx_string("lazyfirewall_engine"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1, ngx_conf_set_str_slot, NGX_HTTP_MAIN_CONF_OFFSET, offsetof(ngx_lazyfirewall_conf_t, engine), NULL },
-    { ngx_string("lazyfirewall_fail_open"), NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG, ngx_conf_set_flag_slot, NGX_HTTP_MAIN_CONF_OFFSET, offsetof(ngx_lazyfirewall_conf_t, fail_open), NULL },
-    { ngx_string("lazyfirewall_timeout"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1, ngx_conf_set_msec_slot, NGX_HTTP_MAIN_CONF_OFFSET, offsetof(ngx_lazyfirewall_conf_t, timeout), NULL },
-    { ngx_string("lazyfirewall_max_uri_len"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1, ngx_conf_set_num_slot, NGX_HTTP_MAIN_CONF_OFFSET, offsetof(ngx_lazyfirewall_conf_t, max_uri_len), NULL },
-    { ngx_string("lazyfirewall_max_host_len"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1, ngx_conf_set_num_slot, NGX_HTTP_MAIN_CONF_OFFSET, offsetof(ngx_lazyfirewall_conf_t, max_host_len), NULL },
+    { ngx_string("lazyfirewall_engine"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot, NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_lazyfirewall_conf_t, engine), NULL },
+
+    { ngx_string("lazyfirewall_fail_open"), NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot, NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_lazyfirewall_conf_t, fail_open), NULL },
+
+    { ngx_string("lazyfirewall_timeout"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot, NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_lazyfirewall_conf_t, timeout), NULL },
+
+    { ngx_string("lazyfirewall_max_uri_len"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot, NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_lazyfirewall_conf_t, max_uri_len), NULL },
+
+    { ngx_string("lazyfirewall_max_host_len"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot, NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_lazyfirewall_conf_t, max_host_len), NULL },
+
     ngx_null_command
 };
 
-// mark failure in shared memory
+/* =========================================================
+ * Health mark failure
+ * ========================================================= */
 static void
 lazyfw_mark_failure(ngx_lazyfirewall_conf_t *conf, ngx_log_t *log)
 {
     if (conf->health == NULL) return;
 
-    if (ngx_shmtx_lock(&conf->health_mutex)) {
-        conf->health->last_failure = ngx_time();
-        ngx_shmtx_unlock(&conf->health_mutex);
-    } else {
-        ngx_log_error(NGX_LOG_WARN, log, 0,
-                      "lazyfirewall: failed to acquire health lock (cannot mark failure)");
-    }
+    ngx_shmtx_lock(&conf->health_mutex);
+    conf->health->last_failure = ngx_time();
+    ngx_shmtx_unlock(&conf->health_mutex);
 }
 
-
-// access handler
+/* =========================================================
+ * ACCESS handler
+ * ========================================================= */
 static ngx_int_t
 ngx_lazyfirewall_handler(ngx_http_request_t *r)
 {
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                  "[lazyfirewall] handler invoked");
     ngx_lazyfirewall_conf_t *conf = ngx_http_get_module_main_conf(r, ngx_http_lazyfirewall_module);
 
     if (r->connection->error) {
@@ -228,13 +292,13 @@ ngx_lazyfirewall_handler(ngx_http_request_t *r)
     }
 
     if (conf->engine.len == 0) {
-        return NGX_DECLINED;
+        conf->engine = lazyfw_default_engine;
     }
 
     /* Early oversized reject */
     if (r->unparsed_uri.len > conf->max_uri_len ||
         r->connection->addr_text.len > 64) {
-        return NGX_HTTP_REQUEST_URI_TOO_LONG;
+        return NGX_HTTP_REQUEST_URI_TOO_LARGE;
     }
 
     ngx_str_t host = ngx_null_string;
@@ -248,21 +312,17 @@ ngx_lazyfirewall_handler(ngx_http_request_t *r)
     /* Cooldown check - conservative on lock failure */
     ngx_uint_t cooldown_active = 0;
     if (conf->health) {
-        if (ngx_shmtx_lock(&conf->health_mutex)) {
-            time_t now = ngx_time();
-            if (conf->health->last_failure > 0 && (now - conf->health->last_failure) < LAZYFW_HEALTH_COOLDOWN) {
-                cooldown_active = 1;
-            }
-            ngx_shmtx_unlock(&conf->health_mutex);
-        } else {
-            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                          "lazyfirewall: failed to acquire health lock");
-            cooldown_active = 1;  /* conservative: assume unhealthy */
+        ngx_shmtx_lock(&conf->health_mutex);
+        time_t now = ngx_time();
+        if (conf->health->last_failure > 0 && (now - conf->health->last_failure) < LAZYFW_HEALTH_COOLDOWN) {
+            cooldown_active = 1;
         }
+        ngx_shmtx_unlock(&conf->health_mutex);
     }
 
     if (cooldown_active) {
-        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "lazyfirewall: backend unhealthy, skipping");
+        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                      "lazyfirewall: backend unhealthy, skipping");
         return conf->fail_open ? NGX_DECLINED : NGX_HTTP_FORBIDDEN;
     }
 
@@ -270,7 +330,8 @@ ngx_lazyfirewall_handler(ngx_http_request_t *r)
     if (lazyfw_sock == -1) {
         lazyfw_sock = socket(AF_UNIX, SOCK_STREAM, 0);
         if (lazyfw_sock == -1) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_socket_errno, "lazyfirewall: socket() failed");
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_socket_errno,
+                          "lazyfirewall: socket() failed");
             lazyfw_mark_failure(conf, r->connection->log);
             goto failed;
         }
@@ -289,7 +350,8 @@ ngx_lazyfirewall_handler(ngx_http_request_t *r)
         addr.sun_path[path_len] = '\0';
 
         if (connect(lazyfw_sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_socket_errno, "lazyfirewall: connect failed");
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_socket_errno,
+                          "lazyfirewall: connect failed");
             close(lazyfw_sock);
             lazyfw_sock = -1;
             lazyfw_mark_failure(conf, r->connection->log);
@@ -302,19 +364,19 @@ ngx_lazyfirewall_handler(ngx_http_request_t *r)
     u_char *p = json_buf;
     u_char *end_p = json_buf + sizeof(json_buf) - 1;
 
-    p = ngx_cpymem(p, "{\"ip\":", 6);
+    p = ngx_cpymem(p, "{\"ip\":", sizeof("{\"ip\":") - 1);
     p = lazyfw_append_json_escaped(p, end_p, &r->connection->addr_text);
     if (p == NULL) goto json_overflow;
 
-    p = ngx_cpymem(p, ",\"host\":", 9);
+    p = ngx_cpymem(p, ",\"host\":",   sizeof(",\"host\":") - 1);
     p = lazyfw_append_json_escaped(p, end_p, &host);
     if (p == NULL) goto json_overflow;
 
-    p = ngx_cpymem(p, ",\"method\":", 10);
+    p = ngx_cpymem(p, ",\"method\":", sizeof(",\"method\":") - 1);
     p = lazyfw_append_json_escaped(p, end_p, &r->method_name);
     if (p == NULL) goto json_overflow;
 
-    p = ngx_cpymem(p, ",\"uri\":", 8);
+    p = ngx_cpymem(p, ",\"uri\":",    sizeof(",\"uri\":") - 1);
     p = lazyfw_append_json_escaped(p, end_p, &r->unparsed_uri);
     if (p == NULL) goto json_overflow;
 
@@ -323,7 +385,8 @@ ngx_lazyfirewall_handler(ngx_http_request_t *r)
     size_t json_len = p - json_buf;
 
     if (write(lazyfw_sock, json_buf, json_len) != (ssize_t)json_len) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_socket_errno, "lazyfirewall: write failed");
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_socket_errno,
+                      "lazyfirewall: write failed");
         close(lazyfw_sock);
         lazyfw_sock = -1;
         lazyfw_mark_failure(conf, r->connection->log);
@@ -333,7 +396,8 @@ ngx_lazyfirewall_handler(ngx_http_request_t *r)
     char resp_buf[512];
     ssize_t n = read(lazyfw_sock, resp_buf, sizeof(resp_buf) - 1);
     if (n <= 0) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, n == 0 ? 0 : ngx_socket_errno, "lazyfirewall: read failed");
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, n == 0 ? 0 : ngx_socket_errno,
+                      "lazyfirewall: read failed");
         close(lazyfw_sock);
         lazyfw_sock = -1;
         lazyfw_mark_failure(conf, r->connection->log);
@@ -343,7 +407,7 @@ ngx_lazyfirewall_handler(ngx_http_request_t *r)
     resp_buf[n] = '\0';
 
     /* Trim and strict validate */
-    while (n > 0 && ngx_isspace(resp_buf[n-1])) n--;
+    while (n > 0 && isspace((unsigned char)resp_buf[n-1])) n--;
     resp_buf[n] = '\0';
 
     if (n == 5 && ngx_strncasecmp((u_char *)resp_buf, (u_char *)"block", 5) == 0) {
@@ -353,31 +417,29 @@ ngx_lazyfirewall_handler(ngx_http_request_t *r)
     return NGX_DECLINED;
 
 json_overflow:
-    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "lazyfirewall: JSON buffer overflow (oversized input)");
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                  "lazyfirewall: JSON buffer overflow (oversized input)");
 failed:
     return conf->fail_open ? NGX_DECLINED : NGX_HTTP_FORBIDDEN;
 }
 
-// phase init function
-static ngx_int_t
-ngx_lazyfirewall_init(ngx_conf_t *cf)
-{
-    ngx_http_core_main_conf_t *cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-    ngx_http_handler_pt *h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
-    if (h == NULL) {
-        return NGX_ERROR;
-    }
-    *h = ngx_lazyfirewall_handler;
-    return NGX_OK;
-}
+/* =========================================================
+ * Phase init
+ * ========================================================= */
 
-// module context and definition
+
+/* =========================================================
+ * Module definition
+ * ========================================================= */
 static ngx_http_module_t ngx_lazyfirewall_module_ctx = {
     NULL,                                /* preconfiguration */
-    ngx_lazyfirewall_init,               /* postconfiguration */
+    ngx_lazyfirewall_postconfig,               /* postconfiguration */
     ngx_lazyfirewall_create_conf,        /* create main conf */
-    ngx_lazyfirewall_merge_conf,         /* merge main conf */
-    NULL, NULL, NULL, NULL
+    ngx_lazyfirewall_init_main_conf,     /* init main conf */
+    NULL,                                /* create server conf */
+    NULL,                                /* merge server conf */
+    NULL,                                /* create location conf */
+    NULL                                 /* merge location conf */
 };
 
 ngx_module_t ngx_http_lazyfirewall_module = {
@@ -385,12 +447,10 @@ ngx_module_t ngx_http_lazyfirewall_module = {
     &ngx_lazyfirewall_module_ctx,
     ngx_lazyfirewall_commands,
     NGX_HTTP_MODULE,
-    NULL,                                /* init master */
-    NULL,                                /* init module */
-    ngx_lazyfirewall_init_process,       /* init process */
-    NULL,                                /* init thread */
-    NULL,                                /* exit thread */
-    ngx_lazyfirewall_exit_process,       /* exit process */
-    NULL,                                /* exit master */
+    NULL, NULL,
+    ngx_lazyfirewall_init_process,
+    NULL, NULL,
+    ngx_lazyfirewall_exit_process,
+    NULL,
     NGX_MODULE_V1_PADDING
 };
